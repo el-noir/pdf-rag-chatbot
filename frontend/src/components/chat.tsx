@@ -46,6 +46,59 @@ const ChatComponent: React.FC = () => {
     });
   };
 
+  // Render assistant content into headings, paragraphs, and bullet lists
+  const renderAssistantContent = (content?: string) => {
+    if (!content) return null;
+    const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const elements: React.ReactNode[] = [];
+
+    let currentList: string[] | null = null;
+
+    const flushList = () => {
+      if (currentList) {
+        elements.push(
+          <ul key={elements.length} className="list-disc pl-6 space-y-1 text-sm text-gray-800">
+            {currentList.map((li, i) => (
+              <li key={i}>{li}</li>
+            ))}
+          </ul>
+        );
+        currentList = null;
+      }
+    };
+
+    for (const line of lines) {
+      // bullet-like lines
+      if (/^([-\u2022\*]|•)\s+/.test(line) || /^\d+\./.test(line)) {
+        const cleaned = line.replace(/^([-\u2022\*\d+.]+)\s*/, '');
+        currentList = currentList ?? [];
+        currentList.push(cleaned);
+        continue;
+      }
+
+      // If we hit a normal line but had a list accumulating, flush it
+      if (currentList) flushList();
+
+      // Headings: lines that are bold-marked or end with ':' or are short all-caps
+      if (/^\*\*(.+)\*\*$/.test(line)) {
+        const m = line.match(/^\*\*(.+)\*\*$/);
+        elements.push(<div key={elements.length} className="font-semibold text-gray-900">{m?.[1]}</div>);
+        continue;
+      }
+
+      if (line.endsWith(':') || (line.length < 60 && line === line.toUpperCase())) {
+        elements.push(<div key={elements.length} className="font-semibold text-gray-900">{line.replace(/:$/, '')}</div>);
+        continue;
+      }
+
+      // Otherwise paragraph
+      elements.push(<p key={elements.length} className="text-sm text-gray-800">{line}</p>);
+    }
+
+    flushList();
+    return <div className="space-y-2">{elements}</div>;
+  };
+
   const handleSendChatMessage = async () => {
     if (!message.trim() || loading) return;
 
@@ -115,35 +168,39 @@ const ChatComponent: React.FC = () => {
                 <p className="whitespace-pre-wrap">{msg.content}</p>
               ) : (
                 <div>
-                  <div className="whitespace-pre-wrap mb-2">{msg.content}</div>
-                  
+                  {/* Render assistant content in a UI-friendly way */}
+                  <div className="prose max-w-none">
+                    {renderAssistantContent(msg.content)}
+                  </div>
+
                   {msg.documents && msg.documents.length > 0 && (
                     <div className="mt-3 pt-3 border-t border-gray-300">
                       <button
                         onClick={() => toggleDocExpansion(index)}
-                        className="text-xs text-blue-600 hover:text-blue-800 mb-2"
+                        className="text-sm text-blue-600 hover:text-blue-800 mb-2"
                       >
-                        {expandedDocs.has(index) ? '▼ Hide' : '▶ Show'} sources ({msg.documents.length})
+                        {expandedDocs.has(index) ? '▼ Hide sources' : `▶ Show sources (${msg.documents.length})`}
                       </button>
-                      
+
                       {expandedDocs.has(index) && (
                         <div className="space-y-2 mt-2">
                           {msg.documents.map((doc, docIndex) => (
                             <div
                               key={docIndex}
-                              className="bg-white rounded p-3 text-xs border border-gray-200"
+                              className="bg-white rounded p-3 text-sm border border-gray-200"
                             >
-                              <div className="font-semibold mb-1 text-gray-700">
-                                Source {docIndex + 1}
+                              <div className="flex items-center justify-between mb-1">
+                                <div className="font-semibold text-gray-800">Source {docIndex + 1}</div>
                                 {doc.metadata?.loc?.pageNumber && (
-                                  <span className="ml-2 text-gray-500">
-                                    (Page {doc.metadata.loc.pageNumber})
-                                  </span>
+                                  <div className="text-gray-500 text-xs">Page {doc.metadata.loc.pageNumber}</div>
                                 )}
                               </div>
-                              <div className="text-gray-600 max-h-32 overflow-y-auto">
-                                {doc.pageContent}
+                              <div className="text-gray-700 max-h-36 overflow-y-auto text-sm">
+                                {doc.pageContent?.length > 400 ? doc.pageContent.slice(0, 400) + '...' : doc.pageContent}
                               </div>
+                              {doc.metadata?.source && (
+                                <div className="mt-2 text-xs text-gray-500">Source: {doc.metadata.source}</div>
+                              )}
                             </div>
                           ))}
                         </div>

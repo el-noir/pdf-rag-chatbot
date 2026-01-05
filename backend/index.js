@@ -9,6 +9,7 @@ import dotenv from 'dotenv'
 import { pipeline } from '@xenova/transformers';
 import { QdrantVectorStore } from "@langchain/qdrant";
 import { Embeddings } from "@langchain/core/embeddings";
+import { enhancedRetrieval } from './query-enhancer.js';
 
 dotenv.config()
 
@@ -45,7 +46,10 @@ class LocalEmbeddings extends Embeddings {
         const embeddings = await Promise.all(
             textStrings.map(async (text) => {
                 const output = await model(text, { pooling: 'mean', normalize: true });
-                return Array.from(output.data);
+                const embedding = Array.from(output.data);
+                // L2 normalize
+                const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+                return magnitude > 0 ? embedding.map(v => v / magnitude) : embedding;
             })
         );
         return embeddings;
@@ -54,7 +58,10 @@ class LocalEmbeddings extends Embeddings {
     async embedQuery(text) {
         const model = await this._getModel();
         const output = await model(text, { pooling: 'mean', normalize: true });
-        return Array.from(output.data);
+        const embedding = Array.from(output.data);
+        // L2 normalize
+        const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+        return magnitude > 0 ? embedding.map(v => v / magnitude) : embedding;
     }
 }
 
@@ -102,39 +109,91 @@ app.get('/chat', async (req, res)=>{
         return res.status(400).json({ error: 'Please provide a message query parameter' })
     }
 
+    console.log(`[${new Date().toISOString()}] Query: "${userQuery}"`);
+
     const embeddings = new LocalEmbeddings();
 
     const vectorStore = await QdrantVectorStore.fromExistingCollection(
         embeddings,
         {
             url: 'http://localhost:6333',
-            collectionName: 'langchainjs-testing',
+            collectionName: 'air-university2',
         }
     );
 
-    // Increase k to get more relevant documents (5-10 is usually good)
-    const ret = vectorStore.asRetriever({
-        k: 5
-    })
+    // Use enhanced retrieval for better results
+    const { results, formatted, stats } = await enhancedRetrieval(
+        vectorStore,
+        userQuery,
+        {
+            topK: 15,              // Retrieve more candidates
+            finalK: 5,             // Return top 5 after reranking
+            useEnhancement: true,  // Enhance query
+            useReranking: true,    // Rerank by quality
+            deduplicate: true,     // Remove duplicates
+        }
+    );
 
-    const result = await ret.invoke(userQuery);
+    console.log(`[${new Date().toISOString()}] Retrieved: ${stats.retrieved} → Final: ${stats.final}`);
+    results.forEach(([doc, score], i) => {
+        console.log(`  ${i + 1}. Score: ${score.toFixed(4)} - ${doc.pageContent.slice(0, 100)}...`);
+    });
 
-    // Format the context better - extract pageContent from documents
-    const contextText = result.map((doc, index) => {
-        const content = doc.pageContent || doc.content || JSON.stringify(doc);
-        return `[Document ${index + 1}]:\n${content}\n`;
-    }).join('\n---\n\n');
+    // Extract documents from results
+    const retrievedDocs = results.map(([doc, score]) => ({
+        pageContent: doc.pageContent,
+        metadata: doc.metadata,
+        score: score
+    }));
 
-    const SYSTEM_PROMPT = `You are a helpful AI Assistant who answers user queries based on the available context from PDF files.
+    // Use the pre-formatted context
+    const contextText = formatted;
 
-IMPORTANT: 
-- Answer ONLY based on the provided context
-- If the context doesn't contain the answer, say "I don't have that information in the provided documents"
-- Be specific and cite relevant details from the context
-- For fee-related queries, provide exact amounts and details when available
+    const SYSTEM_PROMPT = `You are the Air University AI Assistant. Provide clear, concise, and helpful answers to students and faculty.
 
-Context from documents:
-${contextText}`;
+### RULES:
+1. **Answer ONLY from the provided documents** - Never make up information
+2. **Be direct and concise** - Get to the point immediately
+3. **Use clean formatting**:
+   - Start with the main answer (no introduction)
+   - Use simple bullet points (•) not nested bullets
+   - Use **bold** for important terms
+   - Keep paragraphs short (2-3 lines max)
+   - Use clear section headers when needed
+
+4. **Avoid these**:
+   - ❌ Don't say "Based on the provided documents..."
+   - ❌ Don't repeat "unfortunately" or "I couldn't find"
+   - ❌ Don't list what's missing at the end
+   - ❌ Don't use phrases like "It is recommended to check..."
+   - ❌ Don't use document citations like [Document 1] unless critical
+   - ❌ Don't add "Additional Notes" or "Important Notes" sections
+
+5. **If information is missing**: Simply state what you know and say "For specific details, please contact [relevant office]" at the end
+
+6. **Format examples**:
+
+Good:
+"**Dress Code for Male Students:**
+• Formal trousers with tucked-in shirts
+• Black or brown shoes
+• No shorts, T-shirts, or ripped jeans
+
+**Dress Code for Female Students:**
+• Modest and professional attire
+• No revealing outfits
+
+Improperly dressed students may be fined or asked to leave."
+
+Bad:
+"**Dress Code Policy:**
+Unfortunately, the provided documents mention that... [verbose explanation]
+**Additional Notes:** It is important to note that..."
+
+### CONTEXT:
+${contextText}
+
+Answer directly and concisely:`;
     
     const chatResult = await client.chat.completions.create({
         model: "llama-3.1-8b-instant",
@@ -142,16 +201,30 @@ ${contextText}`;
             {role: 'system', content: SYSTEM_PROMPT},
             {role: 'user', content: userQuery},
         ],
-        temperature: 0.7,
+        temperature: 0.2,  // Very low for consistent, focused responses
+        max_tokens: 800,   // Moderate length - concise but complete
     })
+
+    // Clean up response
+    let response = chatResult.choices[0].message.content;
+    
+    // Remove common verbose patterns
+    response = response.replace(/^(Based on the provided documents?[,:]?\s*)/i, '');
+    response = response.replace(/^(According to the documents?[,:]?\s*)/i, '');
+    response = response.replace(/Unfortunately,?\s*/gi, '');
+    response = response.replace(/\[Document \d+\]\s*/g, ''); // Remove document citations in text
+    response = response.replace(/\(Relevance:[\s\d.%]+\)/g, ''); // Remove relevance scores
+    
+    // Clean up excessive "Important Notes" or "Additional Information" sections at the end
+    response = response.replace(/\n\n#{1,3}\s*(Important Notes?|Additional Information|Additional Notes?|Note):?\s*\n[\s\S]*?(check|contact|visit|recommended|may vary)[\s\S]*$/i, '');
+    
+    // Trim excessive whitespace
+    response = response.replace(/\n{3,}/g, '\n\n').trim();
 
     return res.json(
         {
-            message: chatResult.choices[0].message.content,
-            docs: result.map(doc => ({
-                pageContent: doc.pageContent || doc.content,
-                metadata: doc.metadata
-            })),
+            message: response,
+            docs: retrievedDocs,
         }
     )
 })
